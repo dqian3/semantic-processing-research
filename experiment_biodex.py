@@ -30,8 +30,11 @@ import lotus
 import pandas as pd
 from datasets import load_dataset
 from lotus.models import LM, SentenceTransformersRM
+from lotus.types import CascadeArgs, UsageLimit
 from lotus.vector_store import FaissVS
 from colbert_rm import CachedColBERTRM
+
+litellm._turn_on_debug()
 
 # ---------------------------------------------------------------------------
 # Token / cost tracking — same callback pattern as experiment.py
@@ -182,10 +185,11 @@ def agentic_predict(
     labels_df: pd.DataFrame,
     max_turns: int = 5,
     search_k: int = 20,
+    verbose: bool = False,
 ) -> list[str]:
     messages = [
         {"role": "system", "content": AGENTIC_SYSTEM},
-        {"role": "user",   "content": f"ARTICLE:\n{article[:4000]}"},
+        {"role": "user",   "content": f"ARTICLE:\n{article}"},
     ]
 
     for _ in range(max_turns):
@@ -203,6 +207,8 @@ def agentic_predict(
                 query     = json.loads(tc.function.arguments).get("query", "")
                 retrieved = labels_df.sem_search("reaction", query, K=search_k)
                 results   = "\n".join(retrieved["reaction"].tolist())
+                if verbose:
+                    print(f"  [tool] search_reactions({query!r}) → {retrieved['reaction'].tolist()[:5]} …")
                 messages.append({
                     "role":         "tool",
                     "tool_call_id": tc.id,
@@ -210,6 +216,8 @@ def agentic_predict(
                 })
         else:
             raw = (msg.content or "").strip()
+            if verbose:
+                print(f"  [agent] final answer: {raw[:200]}")
             try:
                 start = raw.index("[")
                 end   = raw.rindex("]") + 1
@@ -236,17 +244,33 @@ RANK_PROMPT = (
 )
 
 
-def lotus_predict(article: str, labels_df: pd.DataFrame, top_k: int) -> list[str]:
-    article_df = pd.DataFrame([{"text": article[:4000]}])
+def lotus_predict(
+    articles_df: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    top_k: int,
+    verbose: bool = False,
+) -> list[list[str]]:
+    matched = articles_df[["id", "text"]].sem_join(
+        labels_df,
+        JOIN_PROMPT,
+        cascade_args=CascadeArgs(recall_target=0.9),
+    )
 
-    matched = article_df.sem_join(labels_df, JOIN_PROMPT)
+    if verbose:
+        print(f"  [lotus] sem_join matched {len(matched)} (article, reaction) pairs across {len(articles_df)} articles")
 
     if matched.empty:
-        return []
+        return [[] for _ in range(len(articles_df))]
 
-    # Step 2: listwise ranking via sem_topk
-    ranked = matched.sem_topk(RANK_PROMPT, K=top_k)
-    return ranked["reaction"].tolist()
+    # Rank reactions per article
+    preds: dict[int, list[str]] = {}
+    for article_id, group in matched.groupby("id"):
+        ranked = group.sem_topk(RANK_PROMPT, K=top_k)
+        if verbose:
+            print(f"  [lotus] article {article_id}: {len(group)} candidates → top {top_k}: {ranked['reaction'].tolist()}")
+        preds[article_id] = ranked["reaction"].tolist()
+
+    return [preds.get(row.id, []) for row in articles_df.itertuples()]
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +287,12 @@ def parse_args() -> argparse.Namespace:
                    help="Directory to cache ColBERT index over reaction labels")
     p.add_argument("--colbert", action="store_true",
                    help="Use ColBERT retriever (GPU required). Default: SentenceTransformers (CPU-friendly).")
+    p.add_argument("--rate-limit", type=int, default=50,
+                   help="Max LM requests per minute sent to the API (default: 50). Lower to avoid 429s.")
+    p.add_argument("--max-budget", type=float, default=None,
+                   help="Hard cost cap in USD for LOTUS LM calls (e.g. 1.0). No limit by default.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Print tool calls and intermediate reasoning for each article.")
     p.add_argument("--output",    default=None, help="Write per-article results as JSONL")
     return p.parse_args()
 
@@ -273,7 +303,19 @@ def main() -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
 
-    lm = LM(model=f"anthropic/{args.model}")
+    # Retry on 429 / transient errors for agentic litellm calls
+    litellm.num_retries = 5
+
+    usage_limit = (
+        UsageLimit(total_cost_limit=args.max_budget)
+        if args.max_budget is not None
+        else UsageLimit()
+    )
+    lm = LM(
+        model=f"anthropic/{args.model}",
+        rate_limit=args.rate_limit,
+        physical_usage_limit=usage_limit,
+    )
     if args.colbert:
         rm = CachedColBERTRM()
         lotus.settings.configure(lm=lm, rm=rm)
@@ -307,8 +349,10 @@ def main() -> None:
         tracker.reset()
         t_start = time.perf_counter()
         for i, article_row in enumerate(articles_df.itertuples(), 1):
+            if args.verbose:
+                print(f"\n[agentic] article {i}:")
             pred = agentic_predict(args.model, article_row.text, labels_df,
-                                   search_k=args.top_k * 2)
+                                   search_k=args.top_k * 2, verbose=args.verbose)
             agentic_preds.append(pred)
             rp5  = rp_at_k(pred, article_row.reactions, 5)
             rp10 = rp_at_k(pred, article_row.reactions, 10)
@@ -320,9 +364,8 @@ def main() -> None:
     if run_lotus:
         tracker.reset()
         t_start = time.perf_counter()
-        for i, article_row in enumerate(articles_df.itertuples(), 1):
-            pred = lotus_predict(article_row.text, labels_df, top_k=args.top_k)
-            lotus_preds.append(pred)
+        lotus_preds = lotus_predict(articles_df, labels_df, top_k=args.top_k, verbose=args.verbose)
+        for i, (pred, article_row) in enumerate(zip(lotus_preds, articles_df.itertuples()), 1):
             rp5  = rp_at_k(pred, article_row.reactions, 5)
             rp10 = rp_at_k(pred, article_row.reactions, 10)
             print(f"[lotus   {i:>4}/{len(articles_df)}]  RP@5={rp5:.2f}  RP@10={rp10:.2f}  gold={article_row.reactions[:3]}  pred={pred[:5]} …")
