@@ -126,10 +126,7 @@ class CachedColBERTRM:
         print(f"[ColBERT] Loading docs from '{docs_path}' …", flush=True)
         t0 = time.perf_counter()
         with open(docs_path, "rb") as fp:
-            with tqdm(total=docs_path.stat().st_size, desc="  reading docs",
-                      unit="B", unit_scale=True, dynamic_ncols=True) as pbar:
-                self.docs = pickle.load(fp)
-                pbar.update(docs_path.stat().st_size)
+            self.docs = pickle.load(fp)
         elapsed = time.perf_counter() - t0
         print(f"[ColBERT] Loaded {len(self.docs):,} docs in {elapsed:.1f}s. "
               f"Searcher will be initialised on first query.", flush=True)

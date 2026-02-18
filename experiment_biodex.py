@@ -3,7 +3,7 @@ Experiment: extreme multi-label drug-reaction classification on BioDEX.
 
 Compares:
   1. Agentic - LLM with a search_reactions tool; returns a ranked label list.
-  2. LOTUS   - sem_join (articles × reactions) + sem_topk listwise ranking.
+  2. LOTUS   - sem_join (articles x reactions) + sem_topk listwise ranking.
 
 Metric: Rank-Precision@K (RP@K), following prior work.
   RP@K = (# true reactions in top-K predictions) / K
@@ -30,6 +30,7 @@ import lotus
 import pandas as pd
 from datasets import load_dataset
 from lotus.models import LM, SentenceTransformersRM
+from lotus.vector_store import FaissVS
 from colbert_rm import CachedColBERTRM
 
 # ---------------------------------------------------------------------------
@@ -62,38 +63,41 @@ litellm.success_callback = [tracker]
 def load_biodex(limit: int = 250) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns:
-      articles_df  - columns: [id, text, reactions]   (reactions = list[str])
-      labels_df    - columns: [reaction]               (all unique MedDRA labels)
+      articles_df  - columns: [id, text, reactions]  (sampled test articles)
+      labels_df    - columns: [reaction]              (ALL unique MedDRA labels across every split)
+
+    Labels are collected from all splits so we have the full ~24K label space,
+    not just the reactions present in the sampled articles.
     """
     print("Loading BioDEX dataset from HuggingFace …", flush=True)
-    ds = load_dataset("BioDEX/BioDEX-Reactions", split="test")
-    ds = ds.select(range(min(limit, len(ds))))
+    dataset = load_dataset("BioDEX/BioDEX-Reactions")
 
-    rows = []
+    # Collect all unique reaction labels from every split
     all_reactions: set[str] = set()
-    for i, item in enumerate(ds):
-        reactions = [r.lower().strip() for r in item["reactions"]]
+    for split in dataset:
+        for item in dataset[split]:
+            for r in item["reactions"].split(", "):
+                r = r.lower().strip()
+                if r:
+                    all_reactions.add(r)
+
+    # Sample evaluation articles from the test split
+    test_ds = dataset["test"].select(range(min(limit, len(dataset["test"]))))
+    rows = []
+    for i, item in enumerate(test_ds):
         rows.append({
             "id":        i,
             "text":      item["fulltext_processed"],
-            "reactions": reactions,
+            "reactions": [r.lower().strip() for r in item["reactions"].split(", ") if r.strip()],
         })
-        all_reactions.update(reactions)
 
     articles_df = pd.DataFrame(rows)
     labels_df   = pd.DataFrame({"reaction": sorted(all_reactions)})
-    print(f"Loaded {len(articles_df)} articles, {len(labels_df):,} unique reaction labels.", flush=True)
+    print(f"Loaded {len(articles_df)} test articles, {len(labels_df):,} unique reaction labels.", flush=True)
+    print(labels_df, flush=True)
+    print(articles_df, flush=True)
     return articles_df, labels_df
 
-
-def build_or_load_index(rm: CachedColBERTRM, docs: list[str], index_dir: str) -> None:
-    """Build the ColBERT index on first run, load it on subsequent runs."""
-    if Path(index_dir).exists():
-        print(f"Loading cached ColBERT index from '{index_dir}' …", flush=True)
-        rm.load_index(index_dir)
-    else:
-        print(f"Building ColBERT index → '{index_dir}' (one-time) …", flush=True)
-        rm.index(docs, index_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +239,6 @@ RANK_PROMPT = (
 def lotus_predict(article: str, labels_df: pd.DataFrame, top_k: int) -> list[str]:
     article_df = pd.DataFrame([{"text": article[:4000]}])
 
-    # Step 1: sem_join — retriever pre-filters candidates, then LLM verifies each pair.
-    # This avoids materialising the full 1 × 24,000 cross product.
     matched = article_df.sem_join(labels_df, JOIN_PROMPT)
 
     if matched.empty:
@@ -272,12 +274,20 @@ def main() -> None:
         sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
 
     lm = LM(model=f"anthropic/{args.model}")
-    rm = CachedColBERTRM() if args.colbert else SentenceTransformersRM(model="intfloat/e5-base-v2")
-    lotus.settings.configure(lm=lm, rm=rm)
+    if args.colbert:
+        rm = CachedColBERTRM()
+        lotus.settings.configure(lm=lm, rm=rm)
+    else:
+        rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
+        lotus.settings.configure(lm=lm, rm=rm, vs=FaissVS())
 
     articles_df, labels_df = load_biodex(args.limit)
-    if args.colbert:
-        build_or_load_index(rm, labels_df["reaction"].tolist(), args.index_dir)
+    if Path(args.index_dir).exists():
+        print(f"Loading cached index from '{args.index_dir}' …", flush=True)
+        labels_df.load_sem_index("reaction", args.index_dir)
+    else:
+        print(f"Building index → '{args.index_dir}' (one-time) …", flush=True)
+        labels_df.sem_index("reaction", args.index_dir)
 
     run_agentic = args.approach in ("agentic", "both")
     run_lotus   = args.approach in ("lotus",   "both")
@@ -300,8 +310,9 @@ def main() -> None:
             pred = agentic_predict(args.model, article_row.text, labels_df,
                                    search_k=args.top_k * 2)
             agentic_preds.append(pred)
-            rp5 = rp_at_k(pred, article_row.reactions, 5)
-            print(f"[agentic {i:>4}/{len(articles_df)}]  RP@5={rp5:.2f}  gold={article_row.reactions[:3]} …")
+            rp5  = rp_at_k(pred, article_row.reactions, 5)
+            rp10 = rp_at_k(pred, article_row.reactions, 10)
+            print(f"[agentic {i:>4}/{len(articles_df)}]  RP@5={rp5:.2f}  RP@10={rp10:.2f}  gold={article_row.reactions[:3]}  pred={pred[:5]} …")
         agentic_time  = time.perf_counter() - t_start
         agentic_usage = {"input": tracker.input_tokens, "output": tracker.output_tokens, "cost": tracker.cost}
 
@@ -312,8 +323,9 @@ def main() -> None:
         for i, article_row in enumerate(articles_df.itertuples(), 1):
             pred = lotus_predict(article_row.text, labels_df, top_k=args.top_k)
             lotus_preds.append(pred)
-            rp5 = rp_at_k(pred, article_row.reactions, 5)
-            print(f"[lotus   {i:>4}/{len(articles_df)}]  RP@5={rp5:.2f}  gold={article_row.reactions[:3]} …")
+            rp5  = rp_at_k(pred, article_row.reactions, 5)
+            rp10 = rp_at_k(pred, article_row.reactions, 10)
+            print(f"[lotus   {i:>4}/{len(articles_df)}]  RP@5={rp5:.2f}  RP@10={rp10:.2f}  gold={article_row.reactions[:3]}  pred={pred[:5]} …")
         lotus_time  = time.perf_counter() - t_start
         lotus_usage = {"input": tracker.input_tokens, "output": tracker.output_tokens, "cost": tracker.cost}
 

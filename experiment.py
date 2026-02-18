@@ -26,7 +26,7 @@ import litellm
 import lotus
 import pandas as pd
 from lotus.models import LM, SentenceTransformersRM
-from colbert_rm import CachedColBERTRM
+from lotus.vector_store import FaissVS
 
 # ---------------------------------------------------------------------------
 # Labels (binary, following LOTUS paper)
@@ -102,14 +102,15 @@ def load_wiki_df(wiki_dir: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_or_load_index(rm: CachedColBERTRM, docs: list[str], index_dir: str) -> None:
-    """Build the ColBERT index on first run, load it on subsequent runs."""
+def build_or_load_index(df: pd.DataFrame, col: str, index_dir: str) -> pd.DataFrame:
+    """Build a Faiss index on first run, load it on subsequent runs."""
     if Path(index_dir).exists():
-        print(f"Loading cached ColBERT index from '{index_dir}' …", flush=True)
-        rm.load_index(index_dir)
+        print(f"Loading cached index from '{index_dir}' …", flush=True)
+        df.load_sem_index(col, index_dir)
     else:
-        print(f"Building ColBERT index → '{index_dir}' (one-time, may take a while) …", flush=True)
-        rm.index(docs, index_dir)
+        print(f"Building index → '{index_dir}' (one-time) …", flush=True)
+        df.sem_index(col, index_dir)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +289,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="claude-haiku-4-5-20251001")
     p.add_argument("--approach", choices=["agentic", "lotus", "both"], default="both")
     p.add_argument("--output", default=None, help="Write per-claim results as JSONL")
-    p.add_argument("--colbert", action="store_true",
-                   help="Use ColBERT retriever (GPU recommended). Default: SentenceTransformers (CPU-friendly).")
     return p.parse_args()
 
 
@@ -300,15 +299,15 @@ def main() -> None:
         sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
 
     lm = LM(model=f"anthropic/{args.model}")
-    rm = CachedColBERTRM() if args.colbert else SentenceTransformersRM(model="intfloat/e5-base-v2")
-    lotus.settings.configure(lm=lm, rm=rm)
+    rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
+    lotus.settings.configure(lm=lm, rm=rm, vs=FaissVS())
 
     claims = load_claims(args.sample, args.limit)
     run_agentic = args.approach in ("agentic", "both")
     run_lotus   = args.approach in ("lotus",   "both")
 
     wiki_df = load_wiki_df(args.wiki_dir)
-    build_or_load_index(rm, wiki_df["text"].tolist(), args.index_dir)
+    wiki_df = build_or_load_index(wiki_df, "text", args.index_dir)
 
     gold_labels:   list[str] = [gold_label(c["label"]) for c in claims]
     agentic_preds: list[str] = []
