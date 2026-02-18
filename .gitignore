@@ -1,0 +1,5 @@
+FEVER
+*.zip
+
+__pycache__
+.env

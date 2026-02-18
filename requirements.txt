@@ -1,0 +1,6 @@
+anthropic
+lotus-ai
+pandas
+datasets
+ragatouille
+tqdm
