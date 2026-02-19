@@ -10,13 +10,16 @@ import pickle
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
 from tqdm import tqdm
 
+from lotus.models.rm import RM
 from lotus.types import RMOutput
+from lotus.vector_store.vs import VS
 
 try:
     from colbert import Indexer, Searcher
@@ -30,7 +33,7 @@ _INDEX_NAME   = "index"        # sub-dir ColBERT writes inside the experiment ro
 _DOCS_FILE    = "docs.pkl"     # stored directly in index_dir
 
 
-class CachedColBERTRM:
+class CachedColBERTRM(RM):
     """
     ColBERTv2 retrieval model with persistent index caching and progress output.
 
@@ -49,11 +52,29 @@ class CachedColBERTRM:
     """
 
     def __init__(self, doc_maxlen: int = 300, nbits: int = 2) -> None:
+        super().__init__()
         self.doc_maxlen  = doc_maxlen
         self.nbits       = nbits
         self.docs:       list[str] | None = None
         self.index_dir:  str | None       = None
         self._searcher:  Any | None       = None   # cached Searcher
+
+    def _embed(self, docs: list[str]) -> NDArray[np.float64]:
+        """Not used for indexing — ColBERTVS.index() handles that. Returns a dummy array."""
+        return np.zeros((len(docs), 1), dtype=np.float64)
+
+    def convert_query_to_query_vector(
+        self,
+        queries: Union["pd.Series", str, list[str], NDArray[np.float64]],
+    ) -> list[str]:
+        """Pass query text through unchanged so ColBERTVS can hand it to the searcher."""
+        if isinstance(queries, str):
+            return [queries]
+        if isinstance(queries, pd.Series):
+            return queries.tolist()
+        if isinstance(queries, np.ndarray):
+            raise TypeError("ColBERT requires text queries, not pre-computed vectors.")
+        return list(queries)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -151,9 +172,14 @@ class CachedColBERTRM:
     def __call__(
         self,
         queries: str | list[str] | NDArray[np.float64],
-        K: int,
+        K: int | None = None,
         **kwargs: Any,
-    ) -> RMOutput:
+    ) -> "RMOutput | NDArray[np.float64]":
+        if K is None:
+            # Called by sem_index for embedding — return dummy; ColBERTVS.index() does the real work
+            if isinstance(queries, str):
+                queries = [queries]
+            return np.zeros((len(queries), 1), dtype=np.float64)
         if isinstance(queries, str):
             queries = [queries]
         assert isinstance(queries, list), "queries must be a str or list[str]"
@@ -166,3 +192,65 @@ class CachedColBERTRM:
         distances = [[r[2] for r in all_results[qid]] for qid in all_results]
 
         return RMOutput(distances=distances, indices=indices)
+
+
+class ColBERTVS(VS):
+    """
+    A LOTUS VS adapter that routes sem_index / sem_search through CachedColBERTRM.
+
+    When LOTUS calls vs.index(), we build the ColBERT index from the docs it passes.
+    When LOTUS calls vs(queries, K), we hand the query text straight to the ColBERT searcher.
+
+    Usage
+    -----
+    rm = CachedColBERTRM()
+    vs = ColBERTVS(rm)
+    lotus.settings.configure(lm=lm, rm=rm, vs=vs)
+
+    # sem_index / load_sem_index then work transparently:
+    df.sem_index("col", "my_index_dir")
+    df.sem_search("col", "query", K=5)
+    """
+
+    def __init__(self, rm: CachedColBERTRM) -> None:
+        super().__init__()
+        self._rm = rm
+
+    def index(self, docs: Any, embeddings: NDArray[np.float64], index_dir: str, **kwargs: Any) -> None:
+        """Build the ColBERT index. `docs` is the pandas Series LOTUS passes; embeddings are ignored."""
+        doc_list = docs.tolist() if hasattr(docs, "tolist") else list(docs)
+        self._rm.index(doc_list, index_dir)
+        self.index_dir = index_dir
+
+    def load_index(self, index_dir: str) -> None:
+        self._rm.load_index(index_dir)
+        self.index_dir = index_dir
+
+    def get_vectors_from_index(self, index_dir: str, ids: list[int]) -> NDArray[np.float64]:
+        raise NotImplementedError("ColBERT does not expose raw document vectors.")
+
+    def __call__(
+        self,
+        queries: Any,
+        K: int,
+        ids: list[int] | None = None,
+        **kwargs: Any,
+    ) -> RMOutput:
+        """Search via ColBERT. `queries` is a list of strings from convert_query_to_query_vector."""
+        if isinstance(queries, str):
+            queries = [queries]
+
+        rm_output = self._rm(queries, K if ids is None else max(K, len(ids)))
+
+        if ids is None:
+            return rm_output
+
+        # Filter results to the requested id subset (best-effort approximation)
+        ids_set = set(ids)
+        filtered_indices: list[list[int]] = []
+        filtered_distances: list[list[float]] = []
+        for q_indices, q_distances in zip(rm_output.indices, rm_output.distances):
+            pairs = [(idx, dist) for idx, dist in zip(q_indices, q_distances) if idx in ids_set][:K]
+            filtered_indices.append([p[0] for p in pairs])
+            filtered_distances.append([p[1] for p in pairs])
+        return RMOutput(distances=filtered_distances, indices=filtered_indices)

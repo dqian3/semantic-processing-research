@@ -10,9 +10,16 @@ Labels are binarised following the LOTUS paper:
 
 Usage:
     python experiment.py [--sample sample.jsonl] [--wiki-dir wiki-pages]
-                         [--limit N] [--model MODEL]
+                         [--limit N] [--model MODEL] [--provider anthropic|ollama]
                          [--approach agentic|lotus|both]
                          [--output results.jsonl]
+
+Examples:
+    # Anthropic (default)
+    python experiment.py --provider anthropic --model claude-haiku-4-5-20251001
+
+    # Ollama (local llama3 8b — must have `ollama serve` running)
+    python experiment.py --provider ollama --model llama3
 """
 
 import argparse
@@ -27,6 +34,7 @@ import lotus
 import pandas as pd
 from lotus.models import LM, SentenceTransformersRM
 from lotus.vector_store import FaissVS
+from colbert_rm import CachedColBERTRM, ColBERTVS
 
 # ---------------------------------------------------------------------------
 # Labels (binary, following LOTUS paper)
@@ -102,9 +110,14 @@ def load_wiki_df(wiki_dir: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_or_load_index(df: pd.DataFrame, col: str, index_dir: str) -> pd.DataFrame:
-    """Build a Faiss index on first run, load it on subsequent runs."""
-    if Path(index_dir).exists():
+def build_or_load_index(df: pd.DataFrame, col: str, index_dir: str, colbert: bool = False) -> pd.DataFrame:
+    """Build an index on first run, load it on subsequent runs."""
+    index_ready = (
+        (Path(index_dir) / "docs.pkl").exists()  # ColBERT
+        if colbert
+        else (Path(index_dir) / "index").exists()  # FaissVS
+    )
+    if index_ready:
         print(f"Loading cached index from '{index_dir}' …", flush=True)
         df.load_sem_index(col, index_dir)
     else:
@@ -143,7 +156,7 @@ SEARCH_TOOL = {
 
 
 def agentic_classify(
-    model: str,
+    full_model: str,
     claim: str,
     wiki_df: pd.DataFrame,
     max_turns: int = 4,
@@ -155,7 +168,7 @@ def agentic_classify(
 
     for _ in range(max_turns):
         response = litellm.completion(
-            model=f"anthropic/{model}",
+            model=full_model,
             max_tokens=256,
             tools=[SEARCH_TOOL],
             messages=messages,
@@ -281,13 +294,18 @@ def print_report(metrics: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fact-checking experiment: Agentic vs LOTUS")
-    p.add_argument("--sample", default="sample.jsonl")
-    p.add_argument("--wiki-dir", default="wiki-pages")
-    p.add_argument("--index-dir", default="wiki_colbert_index",
-                   help="Directory to cache the ColBERT index (built on first run)")
+    p.add_argument("--sample", default="FEVER/sample.jsonl")
+    p.add_argument("--wiki-dir", default="FEVER/wiki-pages")
+    p.add_argument("--index-dir", default="wiki_index",
+                   help="Directory to cache the index (built on first run)")
     p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--model", default="claude-haiku-4-5-20251001")
+    p.add_argument("--model", default="claude-haiku-4-5-20251001",
+                   help="Model name (e.g. claude-haiku-4-5-20251001 or llama3)")
+    p.add_argument("--provider", choices=["anthropic", "ollama"], default="anthropic",
+                   help="Inference provider (default: anthropic). Use 'ollama' for local models.")
     p.add_argument("--approach", choices=["agentic", "lotus", "both"], default="both")
+    p.add_argument("--colbert", action="store_true",
+                   help="Use ColBERT retriever (GPU required). Default: SentenceTransformers.")
     p.add_argument("--output", default=None, help="Write per-claim results as JSONL")
     return p.parse_args()
 
@@ -295,19 +313,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if args.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
 
-    lm = LM(model=f"anthropic/{args.model}")
-    rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
-    lotus.settings.configure(lm=lm, rm=rm, vs=FaissVS())
+    full_model = f"{args.provider}/{args.model}"
+    print(f"Using model: {full_model}", flush=True)
+
+    lm = LM(model=full_model)
+    if args.colbert:
+        rm = CachedColBERTRM()
+        vs = ColBERTVS(rm)
+    else:
+        rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
+        vs = FaissVS()
+    lotus.settings.configure(lm=lm, rm=rm, vs=vs)
 
     claims = load_claims(args.sample, args.limit)
     run_agentic = args.approach in ("agentic", "both")
     run_lotus   = args.approach in ("lotus",   "both")
 
     wiki_df = load_wiki_df(args.wiki_dir)
-    wiki_df = build_or_load_index(wiki_df, "text", args.index_dir)
+    wiki_df = build_or_load_index(wiki_df, "text", args.index_dir, colbert=args.colbert)
 
     gold_labels:   list[str] = [gold_label(c["label"]) for c in claims]
     agentic_preds: list[str] = []
@@ -327,7 +353,7 @@ def main() -> None:
         for i, item in enumerate(claims, 1):
             claim = item["claim"]
             gold  = gold_label(item["label"])
-            pred  = agentic_classify(args.model, claim, wiki_df)
+            pred  = agentic_classify(full_model, claim, wiki_df)
             agentic_preds.append(pred)
             mark = "✓" if pred == gold else "✗"
             print(f"[agentic {i:>4}/{len(claims)}] {mark}  gold={gold:<14} pred={pred:<14}  {claim[:50]}")

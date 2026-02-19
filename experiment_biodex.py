@@ -12,10 +12,17 @@ Dataset: BioDEX from HuggingFace (BioDEX/BioDEX-Reactions).
   Sample size: 250 articles (following the paper).
 
 Usage:
-    python experiment_biodex.py [--limit 250] [--model MODEL] [--top-k 10]
-                                [--approach agentic|lotus|both]
+    python experiment_biodex.py [--limit 250] [--model MODEL] [--provider anthropic|ollama]
+                                [--top-k 10] [--approach agentic|lotus|both]
                                 [--index-dir biodex_colbert_index]
                                 [--output results.jsonl]
+
+Examples:
+    # Anthropic (default)
+    python experiment_biodex.py --provider anthropic --model claude-haiku-4-5-20251001
+
+    # Ollama (local llama3 8b — must have `ollama serve` running)
+    python experiment_biodex.py --provider ollama --model llama3
 """
 
 import argparse
@@ -25,6 +32,8 @@ import sys
 import time
 from pathlib import Path
 
+from pydantic import BaseModel
+
 import litellm
 import lotus
 import pandas as pd
@@ -32,9 +41,9 @@ from datasets import load_dataset
 from lotus.models import LM, SentenceTransformersRM
 from lotus.types import CascadeArgs, UsageLimit
 from lotus.vector_store import FaissVS
-from colbert_rm import CachedColBERTRM
+from colbert_rm import CachedColBERTRM, ColBERTVS
 
-litellm._turn_on_debug()
+# litellm._turn_on_debug()
 
 # ---------------------------------------------------------------------------
 # Token / cost tracking — same callback pattern as experiment.py
@@ -152,13 +161,22 @@ def print_report(metrics: list[dict], ks: list[int]) -> None:
 # Approach 1: Agentic (search_reactions tool → ranked label list)
 # ---------------------------------------------------------------------------
 
-AGENTIC_SYSTEM = """\
-You are a biomedical expert. Given a patient medical article, use the
-search_reactions tool to explore possible drug reaction labels, then output
-a ranked list of the most likely drug reactions for the patient.
+class ReactionList(BaseModel):
+    reactions: list[str]
 
-Output ONLY a JSON array of reaction label strings, ranked most-likely first.
-Example: ["nausea", "vomiting", "headache"]"""
+
+AGENTIC_SYSTEM = """\
+You are a biomedical named-entity extractor. Given a patient medical article,
+use the search_reactions tool to retrieve MedDRA drug reaction labels from the
+catalogue, then select and rank the labels that match reactions described in
+the article.
+
+Rules:
+- You MUST call search_reactions at least once before finishing.
+- Do NOT repeat a query you have already searched — use different terms each time.
+- Only include exact label strings returned by the search_reactions tool.
+- Do not invent, paraphrase, or add any labels not returned by the tool.
+- Do not include commentary, explanations, or non-label text."""
 
 SEARCH_TOOL = {
     "type": "function",
@@ -180,7 +198,7 @@ SEARCH_TOOL = {
 
 
 def agentic_predict(
-    model: str,
+    full_model: str,
     article: str,
     labels_df: pd.DataFrame,
     max_turns: int = 5,
@@ -194,7 +212,7 @@ def agentic_predict(
 
     for _ in range(max_turns):
         response = litellm.completion(
-            model=f"anthropic/{model}",
+            model=full_model,
             max_tokens=512,
             tools=[SEARCH_TOOL],
             messages=messages,
@@ -215,14 +233,24 @@ def agentic_predict(
                     "content":      results or "No matching reactions found.",
                 })
         else:
-            raw = (msg.content or "").strip()
+            # Model finished searching — collect structured answer
+            messages.append({"role": "user", "content": (
+                "Output your final ranked reaction list. "
+                "Use only exact label strings returned by the search_reactions tool — "
+                "no paraphrasing, no invented terms, no commentary."
+            )})
+            final = litellm.completion(
+                model=full_model,
+                max_tokens=512,
+                response_format=ReactionList,
+                messages=messages,
+            )
+            content = final.choices[0].message.content or ""
             if verbose:
-                print(f"  [agent] final answer: {raw[:200]}")
+                print(f"  [agent] structured answer: {content[:200]}")
             try:
-                start = raw.index("[")
-                end   = raw.rindex("]") + 1
-                return json.loads(raw[start:end])
-            except (ValueError, json.JSONDecodeError):
+                return ReactionList.model_validate_json(content).reactions
+            except Exception:
                 return []
 
     return []
@@ -280,14 +308,17 @@ def lotus_predict(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="BioDEX experiment: Agentic vs LOTUS")
     p.add_argument("--limit",     type=int, default=250)
-    p.add_argument("--model",     default="claude-haiku-4-5-20251001")
+    p.add_argument("--model",     default="claude-haiku-4-5-20251001",
+                   help="Model name (e.g. claude-haiku-4-5-20251001 or llama3)")
+    p.add_argument("--provider",  choices=["anthropic", "ollama"], default="anthropic",
+                   help="Inference provider (default: anthropic). Use 'ollama' for local models.")
     p.add_argument("--top-k",     type=int, default=10, help="Max predictions per article")
     p.add_argument("--approach",  choices=["agentic", "lotus", "both"], default="both")
     p.add_argument("--index-dir", default="biodex_colbert_index",
                    help="Directory to cache ColBERT index over reaction labels")
     p.add_argument("--colbert", action="store_true",
                    help="Use ColBERT retriever (GPU required). Default: SentenceTransformers (CPU-friendly).")
-    p.add_argument("--rate-limit", type=int, default=50,
+    p.add_argument("--rate-limit", type=int, default=10,
                    help="Max LM requests per minute sent to the API (default: 50). Lower to avoid 429s.")
     p.add_argument("--max-budget", type=float, default=None,
                    help="Hard cost cap in USD for LOTUS LM calls (e.g. 1.0). No limit by default.")
@@ -300,8 +331,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if args.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
+
+    full_model = f"{args.provider}/{args.model}"
+    print(f"Using model: {full_model}", flush=True)
 
     # Retry on 429 / transient errors for agentic litellm calls
     litellm.num_retries = 5
@@ -312,19 +346,25 @@ def main() -> None:
         else UsageLimit()
     )
     lm = LM(
-        model=f"anthropic/{args.model}",
+        model=full_model,
         rate_limit=args.rate_limit,
         physical_usage_limit=usage_limit,
     )
     if args.colbert:
         rm = CachedColBERTRM()
-        lotus.settings.configure(lm=lm, rm=rm)
+        vs = ColBERTVS(rm)
+        lotus.settings.configure(lm=lm, rm=rm, vs=vs)
     else:
         rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
         lotus.settings.configure(lm=lm, rm=rm, vs=FaissVS())
 
     articles_df, labels_df = load_biodex(args.limit)
-    if Path(args.index_dir).exists():
+    index_ready = (
+        (Path(args.index_dir) / "docs.pkl").exists()  # ColBERT
+        if args.colbert
+        else (Path(args.index_dir) / "index").exists()  # FaissVS
+    )
+    if index_ready:
         print(f"Loading cached index from '{args.index_dir}' …", flush=True)
         labels_df.load_sem_index("reaction", args.index_dir)
     else:
@@ -351,7 +391,7 @@ def main() -> None:
         for i, article_row in enumerate(articles_df.itertuples(), 1):
             if args.verbose:
                 print(f"\n[agentic] article {i}:")
-            pred = agentic_predict(args.model, article_row.text, labels_df,
+            pred = agentic_predict(full_model, article_row.text, labels_df,
                                    search_k=args.top_k * 2, verbose=args.verbose)
             agentic_preds.append(pred)
             rp5  = rp_at_k(pred, article_row.reactions, 5)
