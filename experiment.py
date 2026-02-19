@@ -31,10 +31,178 @@ from pathlib import Path
 
 import litellm
 import lotus
+import numpy as np
 import pandas as pd
+from lotus.dtype_extensions import convert_to_base_data
 from lotus.models import LM, SentenceTransformersRM
+from lotus.types import RMOutput
 from lotus.vector_store import FaissVS
+from tqdm import tqdm
 from colbert_rm import CachedColBERTRM, ColBERTVS
+
+
+# ---------------------------------------------------------------------------
+# Memory-efficient RM + VS: stream embeddings to disk instead of np.vstack
+# ---------------------------------------------------------------------------
+
+class MemmapRM(SentenceTransformersRM):
+    """Writes each embedding batch to a memmap file to avoid the np.vstack RAM spike."""
+
+    _TMP = "./lotus_embed_tmp.mmap"
+
+    def _embed(self, docs: list[str]) -> np.ndarray:
+        dim = self.transformer.get_sentence_embedding_dimension()
+        n = len(docs)
+        mmap = np.memmap(self._TMP, dtype=np.float32, mode="w+", shape=(n, dim))
+        for i in tqdm(range(0, n, self.max_batch_size), desc="Embedding"):
+            batch = docs[i : i + self.max_batch_size]
+            embs = self.transformer.encode(
+                convert_to_base_data(batch),
+                convert_to_tensor=True,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=False,
+            )
+            mmap[i : i + len(batch)] = embs.cpu().numpy()
+            del embs
+        mmap.flush()
+        return mmap
+
+
+class MemmapFaissVS(FaissVS):
+    """Stores vecs as a float32 memmap on disk.
+
+    Search: chunked numpy dot-product — no FAISS index loaded into RAM.
+      Peak RAM = one chunk (~150 MB) regardless of corpus size.
+      Speed: ~100–300 ms/query on CPU (fine when LLM calls dominate).
+
+    Optional FAISS build (call build_faiss_from_vecs() + set use_faiss=True):
+      IVF4096,SQ8 keeps the index at ~1.9 GB instead of 7.5 GB for Flat.
+    """
+
+    _FACTORY = "IVF4096,SQ8"
+    _CHUNK   = 100_000
+    _N_TRAIN = 200_000  # ≥ 39 × nlist recommended for IVF4096
+
+    def __init__(self, factory_string: str | None = None, use_faiss: bool = False, **kwargs):
+        super().__init__(factory_string=factory_string or self._FACTORY, **kwargs)
+        self.use_faiss = use_faiss
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _shape_path(self, index_dir: str) -> str:
+        return f"{index_dir}/vecs.shape"
+
+    def _vecs_path(self, index_dir: str) -> str:
+        return f"{index_dir}/vecs.f32"
+
+    def _open_vecs(self, index_dir: str) -> np.ndarray:
+        with open(self._shape_path(index_dir)) as f:
+            n, dim = map(int, f.read().split(","))
+        return np.memmap(self._vecs_path(index_dir), dtype=np.float32, mode="r", shape=(n, dim))
+
+    # ------------------------------------------------------------------
+    # Optional: build a FAISS IVF+SQ8 index for faster search
+    # ------------------------------------------------------------------
+
+    def build_faiss_from_vecs(self, index_dir: str) -> None:
+        """Train an IVF+SQ8 FAISS index from existing vecs.f32 (skips re-encoding).
+
+        After this succeeds, pass use_faiss=True to MemmapFaissVS to use it.
+        """
+        import faiss as _faiss
+        print(f"Building IVF+SQ8 FAISS index from vecs in '{index_dir}' …", flush=True)
+        src = self._open_vecs(index_dir)
+        n, dim = src.shape
+
+        index = _faiss.index_factory(dim, self.factory_string, self.metric)
+
+        n_train = min(n, self._N_TRAIN)
+        rng = np.random.default_rng(42)
+        idx = np.sort(rng.choice(n, n_train, replace=False))
+        train_vecs = np.ascontiguousarray(src[idx], dtype=np.float32)
+        print(f"  Training on {n_train:,} samples …", flush=True)
+        index.train(train_vecs)
+        del train_vecs
+
+        for i in tqdm(range(0, n, self._CHUNK), desc="Adding to FAISS"):
+            index.add(np.ascontiguousarray(src[i : i + self._CHUNK], dtype=np.float32))
+
+        _faiss.write_index(index, f"{index_dir}/index")
+        self.faiss_index = index
+        self.index_dir = index_dir
+        print("FAISS index written. Re-run with use_faiss=True to use it.", flush=True)
+
+    # ------------------------------------------------------------------
+    # Required VS interface
+    # ------------------------------------------------------------------
+
+    def index(self, docs: list[str], embeddings: np.ndarray, index_dir: str, **kwargs) -> None:
+        n, dim = embeddings.shape
+        os.makedirs(index_dir, exist_ok=True)
+        with open(self._shape_path(index_dir), "w") as f:
+            f.write(f"{n},{dim}")
+        out = np.memmap(self._vecs_path(index_dir), dtype=np.float32, mode="w+", shape=(n, dim))
+        for i in range(0, n, self._CHUNK):
+            out[i : i + self._CHUNK] = embeddings[i : i + self._CHUNK]
+        out.flush()
+        del out
+        Path(f"{index_dir}/index").touch()  # sentinel for build_or_load_index
+        self.index_dir = index_dir
+
+    def load_index(self, index_dir: str) -> None:
+        self.index_dir = index_dir
+        self.vecs = self._open_vecs(index_dir)
+        if self.use_faiss:
+            import faiss as _faiss
+            self.faiss_index = _faiss.read_index(f"{index_dir}/index")
+
+    def get_vectors_from_index(self, index_dir: str, ids: list[int]) -> np.ndarray:
+        return self._open_vecs(index_dir)[ids]
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def __call__(self, query_vectors: np.ndarray, K: int, ids: list[int] | None = None, **kwargs) -> RMOutput:
+        if self.use_faiss:
+            return super().__call__(query_vectors, K, ids=ids, **kwargs)
+
+        q = np.ascontiguousarray(query_vectors, dtype=np.float32)
+        vecs = self._open_vecs(self.index_dir)
+
+        if ids is not None:
+            subset = np.ascontiguousarray(vecs[ids], dtype=np.float32)
+            scores = q @ subset.T
+            local_k = min(K, len(subset))
+            top = np.argsort(-scores, axis=1)[:, :local_k]
+            ids_arr = np.array(ids)
+            return RMOutput(
+                distances=np.take_along_axis(scores, top, axis=1).tolist(),
+                indices=ids_arr[top].tolist(),
+            )
+
+        n = len(vecs)
+        chunk_scores, chunk_indices = [], []
+        for i in range(0, n, self._CHUNK):
+            chunk = np.ascontiguousarray(vecs[i : i + self._CHUNK], dtype=np.float32)
+            cs = q @ chunk.T
+            local_k = min(K, cs.shape[1])
+            top = np.argpartition(-cs, local_k - 1, axis=1)[:, :local_k]
+            chunk_scores.append(np.take_along_axis(cs, top, axis=1))
+            chunk_indices.append(top + i)
+
+        all_scores = np.concatenate(chunk_scores, axis=1)
+        all_indices = np.concatenate(chunk_indices, axis=1)
+        top_k = np.argpartition(-all_scores, K - 1, axis=1)[:, :K]
+        final_scores = np.take_along_axis(all_scores, top_k, axis=1)
+        final_indices = np.take_along_axis(all_indices, top_k, axis=1)
+        order = np.argsort(-final_scores, axis=1)
+        return RMOutput(
+            distances=np.take_along_axis(final_scores, order, axis=1).tolist(),
+            indices=np.take_along_axis(final_indices, order, axis=1).tolist(),
+        )
 
 # ---------------------------------------------------------------------------
 # Labels (binary, following LOTUS paper)
@@ -117,8 +285,19 @@ def build_or_load_index(df: pd.DataFrame, col: str, index_dir: str, colbert: boo
         if colbert
         else (Path(index_dir) / "index").exists()  # FaissVS
     )
+    vecs_only = (
+        not colbert
+        and not index_ready
+        and (Path(index_dir) / "vecs.f32").exists()
+        and (Path(index_dir) / "vecs.shape").exists()
+    )
     if index_ready:
         print(f"Loading cached index from '{index_dir}' …", flush=True)
+        df.load_sem_index(col, index_dir)
+    elif vecs_only:
+        # Embeddings already written — just create the sentinel and load
+        print(f"Found existing vecs in '{index_dir}', skipping re-encoding …", flush=True)
+        Path(index_dir, "index").touch()
         df.load_sem_index(col, index_dir)
     else:
         print(f"Building index → '{index_dir}' (one-time) …", flush=True)
@@ -324,8 +503,8 @@ def main() -> None:
         rm = CachedColBERTRM()
         vs = ColBERTVS(rm)
     else:
-        rm = SentenceTransformersRM(model="intfloat/e5-base-v2")
-        vs = FaissVS()
+        rm = MemmapRM(model="intfloat/e5-small-v2", device="cuda")
+        vs = MemmapFaissVS()
     lotus.settings.configure(lm=lm, rm=rm, vs=vs)
 
     claims = load_claims(args.sample, args.limit)
