@@ -165,18 +165,46 @@ class ReactionList(BaseModel):
     reactions: list[str]
 
 
-AGENTIC_SYSTEM = """\
+# System prompt for providers with reliable tool-calling (Anthropic)
+AGENTIC_SYSTEM_TOOLS = """\
 You are a biomedical named-entity extractor. Given a patient medical article,
-use the search_reactions tool to retrieve MedDRA drug reaction labels from the
-catalogue, then select and rank the labels that match reactions described in
-the article.
+use tools to find and submit the matching MedDRA drug-reaction labels.
+
+Workflow:
+1. Call search_reactions immediately with a medical term from the article (one query per call).
+2. Repeat with different terms until you have enough evidence (2-4 searches total).
+3. Call submit_reactions with your final ranked list, most likely first.
 
 Rules:
-- You MUST call search_reactions at least once before finishing.
-- Do NOT repeat a query you have already searched — use different terms each time.
-- Only include exact label strings returned by the search_reactions tool.
-- Do not invent, paraphrase, or add any labels not returned by the tool.
-- Do not include commentary, explanations, or non-label text."""
+- Call search_reactions immediately — do NOT output analysis text first.
+- You generate all queries yourself from the article content.
+- Never repeat a query you have already searched.
+- Never send an empty or blank query.
+- Only include exact label strings returned by search_reactions.
+- Do not invent, paraphrase, or add labels not returned by the tool."""
+
+# System prompt for providers that don't support tool-calling well (Ollama/local models).
+# Uses a plain-text SEARCH: / REACTIONS: protocol instead.
+AGENTIC_SYSTEM_TEXT = """\
+You are a biomedical named-entity extractor. Given a patient medical article,
+search the MedDRA catalogue for matching drug-reaction labels, then output them.
+
+Each turn: write exactly ONE search line, then stop and wait for results:
+  SEARCH: your medical query here
+
+After 2-3 searches, output your final list in a REACTIONS block (one label per line):
+  REACTIONS:
+  label one
+  label two
+  ...
+
+Rules:
+- Issue ONE SEARCH per response — do not list multiple searches at once.
+- You generate queries yourself from the article content.
+- Never repeat a query you have already run.
+- Never write a blank SEARCH: line.
+- Only include exact label strings returned by the search results.
+- Do not add analysis, preamble, or labels not in the search results."""
 
 SEARCH_TOOL = {
     "type": "function",
@@ -197,6 +225,26 @@ SEARCH_TOOL = {
 }
 
 
+def _parse_reactions_text(content: str) -> list[str]:
+    """Extract reaction list from REACTIONS: block in plain-text output."""
+    lines = content.splitlines()
+    reactions = []
+    in_block = False
+    for line in lines:
+        if line.strip().upper().startswith("REACTIONS:"):
+            in_block = True
+            # handle inline: "REACTIONS: label one"
+            rest = line.split(":", 1)[1].strip()
+            if rest:
+                reactions.append(rest.lower().strip())
+            continue
+        if in_block:
+            label = line.strip().lstrip("-").strip()
+            if label:
+                reactions.append(label.lower())
+    return reactions
+
+
 def agentic_predict(
     full_model: str,
     article: str,
@@ -204,53 +252,107 @@ def agentic_predict(
     max_turns: int = 5,
     search_k: int = 20,
     verbose: bool = False,
+    use_tools: bool = True,
+    max_article_chars: int = 4000,
 ) -> list[str]:
-    messages = [
-        {"role": "system", "content": AGENTIC_SYSTEM},
+    """Predict drug reactions for an article using an agentic search loop.
+
+    use_tools=True  — uses litellm tool-calling (reliable on Anthropic).
+    use_tools=False — uses plain SEARCH:/REACTIONS: text protocol (works on Ollama).
+    """
+    system = AGENTIC_SYSTEM_TOOLS if use_tools else AGENTIC_SYSTEM_TEXT
+    if len(article) > max_article_chars:
+        article = article[:max_article_chars] + "\n[... truncated ...]"
+    messages: list[dict] = [
+        {"role": "system", "content": system},
         {"role": "user",   "content": f"ARTICLE:\n{article}"},
     ]
+    seen_queries: set[str] = set()
 
-    for _ in range(max_turns):
-        response = litellm.completion(
-            model=full_model,
-            max_tokens=512,
-            tools=[SEARCH_TOOL],
-            messages=messages,
-        )
+    for turn in range(max_turns):
+        kwargs: dict = dict(model=full_model, max_tokens=512, messages=messages)
+        if use_tools:
+            kwargs["tools"] = [SEARCH_TOOL]
+            kwargs["tool_choice"] = "auto"
+
+        response = litellm.completion(**kwargs)
         msg = response.choices[0].message
-        messages.append(msg)
+        content = (msg.content or "").strip()
 
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                query     = json.loads(tc.function.arguments).get("query", "")
-                retrieved = labels_df.sem_search("reaction", query, K=search_k)
-                results   = "\n".join(retrieved["reaction"].tolist())
+        if verbose:
+            print(f"  [turn {turn+1}] raw: {content!r}")
+
+        # --- tool-calling path ---
+        if use_tools:
+            messages.append(msg)
+            if verbose and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    print(f"  [turn {turn+1}] tool_call: {tc.function.name}({tc.function.arguments})")
+
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    query = json.loads(tc.function.arguments).get("query", "").strip()
+                    if not query or query in seen_queries:
+                        results = "No matching reactions found."
+                    else:
+                        seen_queries.add(query)
+                        retrieved = labels_df.sem_search("reaction", query, K=search_k)
+                        results = "\n".join(retrieved["reaction"].tolist())
+                        if verbose:
+                            print(f"  [turn {turn+1}] search: {query!r} → {retrieved['reaction'].tolist()[:5]} …")
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc.id, "content": results,
+                    })
+            else:
+                # Model finished searching — collect structured answer
+                messages.append({"role": "user", "content": (
+                    "Output your final ranked reaction list. "
+                    "Use only exact label strings returned by the search_reactions tool — "
+                    "no paraphrasing, no invented terms, no commentary."
+                )})
+                final = litellm.completion(
+                    model=full_model,
+                    max_tokens=512,
+                    response_format=ReactionList,
+                    messages=messages,
+                )
+                final_content = final.choices[0].message.content or ""
                 if verbose:
-                    print(f"  [tool] search_reactions({query!r}) → {retrieved['reaction'].tolist()[:5]} …")
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      results or "No matching reactions found.",
-                })
+                    print(f"  [turn {turn+1}] structured answer: {final_content[:200]}")
+                try:
+                    return ReactionList.model_validate_json(final_content).reactions
+                except Exception:
+                    return []
+
+        # --- text protocol path (Ollama) ---
         else:
-            # Model finished searching — collect structured answer
-            messages.append({"role": "user", "content": (
-                "Output your final ranked reaction list. "
-                "Use only exact label strings returned by the search_reactions tool — "
-                "no paraphrasing, no invented terms, no commentary."
-            )})
-            final = litellm.completion(
-                model=full_model,
-                max_tokens=512,
-                response_format=ReactionList,
-                messages=messages,
-            )
-            content = final.choices[0].message.content or ""
-            if verbose:
-                print(f"  [agent] structured answer: {content[:200]}")
-            try:
-                return ReactionList.model_validate_json(content).reactions
-            except Exception:
+            messages.append({"role": "assistant", "content": content})
+
+            if "reactions:" in content.lower():
+                reactions = _parse_reactions_text(content)
+                if verbose:
+                    print(f"  [turn {turn+1}] reactions: {reactions[:5]} …")
+                return reactions
+
+            search_lines = [
+                l.split("SEARCH:", 1)[1].strip()
+                for l in content.splitlines()
+                if l.strip().upper().startswith("SEARCH:")
+            ][:1]  # enforce one search per turn regardless of model output
+            if search_lines:
+                results_text = ""
+                for query in search_lines:
+                    if not query or query in seen_queries:
+                        continue
+                    seen_queries.add(query)
+                    retrieved = labels_df.sem_search("reaction", query, K=search_k)
+                    results = "\n".join(retrieved["reaction"].tolist())
+                    if verbose:
+                        print(f"  [turn {turn+1}] search: {query!r} → {retrieved['reaction'].tolist()[:5]} …")
+                    results_text += f"Results for '{query}':\n{results or 'No matching reactions found.'}\n\n"
+                messages.append({"role": "user", "content": results_text.strip()})
+            else:
+                # No searches and no REACTIONS block — nothing useful
                 return []
 
     return []
@@ -281,7 +383,11 @@ def lotus_predict(
     matched = articles_df[["id", "text"]].sem_join(
         labels_df,
         JOIN_PROMPT,
-        cascade_args=CascadeArgs(recall_target=0.9),
+        cascade_args=CascadeArgs(
+            recall_target=0.7,
+            sampling_percentage=0.01,
+            cascade_IS_max_sample_range=50,
+        ),
     )
 
     if verbose:
@@ -392,7 +498,8 @@ def main() -> None:
             if args.verbose:
                 print(f"\n[agentic] article {i}:")
             pred = agentic_predict(full_model, article_row.text, labels_df,
-                                   search_k=args.top_k * 2, verbose=args.verbose)
+                                   search_k=args.top_k * 2, verbose=args.verbose,
+                                   use_tools=(args.provider == "anthropic"))
             agentic_preds.append(pred)
             rp5  = rp_at_k(pred, article_row.reactions, 5)
             rp10 = rp_at_k(pred, article_row.reactions, 10)

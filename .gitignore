@@ -3,3 +3,8 @@ FEVER
 
 __pycache__
 .env
+
+*.log
+*.mmap
+
+*_index

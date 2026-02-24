@@ -309,14 +309,40 @@ def build_or_load_index(df: pd.DataFrame, col: str, index_dir: str, colbert: boo
 # Approach 1: Agentic (tool-augmented, searches same wiki corpus)
 # ---------------------------------------------------------------------------
 
-AGENTIC_SYSTEM = """\
-You are a fact-checking assistant. Given a CLAIM, use the search_wikipedia tool
-to retrieve evidence from the Wikipedia corpus, then decide whether the claim is
-supported or not supported.
+# System prompt for providers with reliable tool-calling (Anthropic)
+AGENTIC_SYSTEM_TOOLS = """\
+You are a fact-checking assistant. Given a CLAIM, search Wikipedia for evidence, \
+then give a verdict.
 
-When you have enough evidence, output ONLY one of:
-  supported
-  not supported"""
+Rules:
+- Stop searching as soon as you have enough evidence — do not make unnecessary searches.
+- Never repeat a query you have already run.
+- Never send an empty or blank query.
+- After 1–2 focused searches, give your verdict.
+
+End every response (with or without tool calls) with exactly one of:
+  Verdict: supported
+  Verdict: not supported"""
+
+# System prompt for providers that don't support tool-calling well (Ollama/local models).
+# Uses a plain-text SEARCH: / Verdict: protocol instead.
+AGENTIC_SYSTEM_TEXT = """\
+You are a fact-checking assistant. Given a CLAIM, search Wikipedia for evidence, \
+then give a verdict.
+
+To search Wikipedia write a line in exactly this format (nothing else on the line):
+  SEARCH: your query here
+
+I will reply with the search results. After searching, give your verdict.
+
+Rules:
+- Never repeat a query you have already run.
+- Never write a blank SEARCH: line.
+- Stop searching once you have enough evidence.
+
+End your final response with exactly one of:
+  Verdict: supported
+  Verdict: not supported"""
 
 SEARCH_TOOL = {
     "type": "function",
@@ -334,42 +360,117 @@ SEARCH_TOOL = {
 }
 
 
+def _parse_verdict(text: str) -> str:
+    """Extract verdict from model output, checking last Verdict: line first."""
+    lower = text.strip().lower()
+    verdict_line = next(
+        (l for l in reversed(lower.splitlines()) if "verdict:" in l), lower
+    )
+    if "not supported" in verdict_line:
+        return NOT_SUPPORTED
+    if "supported" in verdict_line:
+        return SUPPORTED
+    return NOT_SUPPORTED
+
+
 def agentic_classify(
     full_model: str,
     claim: str,
     wiki_df: pd.DataFrame,
-    max_turns: int = 4,
+    max_turns: int = 3,
+    verbose: bool = False,
+    use_tools: bool = True,
 ) -> str:
-    messages = [
-        {"role": "system",  "content": AGENTIC_SYSTEM},
-        {"role": "user",    "content": f"CLAIM: {claim}"},
+    """Classify a claim as supported/not-supported using an agentic search loop.
+
+    use_tools=True  — uses litellm tool-calling (reliable on Anthropic).
+    use_tools=False — uses plain SEARCH:/Verdict: text protocol (works on Ollama).
+    """
+    system = AGENTIC_SYSTEM_TOOLS if use_tools else AGENTIC_SYSTEM_TEXT
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": f"CLAIM: {claim}"},
     ]
+    seen_queries: set[str] = set()
 
-    for _ in range(max_turns):
-        response = litellm.completion(
-            model=full_model,
-            max_tokens=256,
-            tools=[SEARCH_TOOL],
-            messages=messages,
-        )
+    for turn in range(max_turns):
+        kwargs: dict = dict(model=full_model, max_tokens=512, messages=messages)
+        if use_tools:
+            kwargs["tools"] = [SEARCH_TOOL]
+            kwargs["tool_choice"] = "auto"
+
+        response = litellm.completion(**kwargs)
         msg = response.choices[0].message
-        messages.append(msg)
+        content = (msg.content or "").strip()
 
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                query     = json.loads(tc.function.arguments).get("query", "")
-                retrieved = wiki_df.sem_search("text", query, K=TOP_K)
-                passages  = "\n".join(
-                    f"[{r.title}] {r.text}" for r in retrieved.itertuples()
-                )
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      passages or "No results found.",
-                })
+        if verbose:
+            print(f"    [turn {turn+1}] raw: {content!r}")
+
+        # --- tool-calling path ---
+        if use_tools:
+            messages.append(msg)
+            if verbose and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    print(f"    [turn {turn+1}] tool_call: {tc.function.name}({tc.function.arguments})")
+
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    query = json.loads(tc.function.arguments).get("query", "").strip()
+                    if not query or query in seen_queries:
+                        passages = "No results found."
+                    else:
+                        seen_queries.add(query)
+                        retrieved = wiki_df.sem_search("text", query, K=TOP_K)
+                        passages = "\n".join(
+                            f"[{r.title}] {r.text}" for r in retrieved.itertuples()
+                        )
+                        if verbose:
+                            print(f"    [turn {turn+1}] search: {query!r}")
+                            for r in retrieved.itertuples():
+                                print(f"      [{r.title}] {r.text[:120]}")
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc.id, "content": passages,
+                    })
+            else:
+                result = _parse_verdict(content)
+                if verbose:
+                    print(f"    [turn {turn+1}] decision: {result!r}")
+                return result
+
+        # --- text protocol path (Ollama) ---
         else:
-            raw = (msg.content or "").strip().lower()
-            return SUPPORTED if raw.startswith("supported") else NOT_SUPPORTED
+            messages.append({"role": "assistant", "content": content})
+            if "verdict:" in content.lower():
+                result = _parse_verdict(content)
+                if verbose:
+                    print(f"    [turn {turn+1}] decision: {result!r}")
+                return result
+            search_lines = [
+                l.split("SEARCH:", 1)[1].strip()
+                for l in content.splitlines()
+                if l.strip().upper().startswith("SEARCH:")
+            ]
+            if search_lines:
+                results_text = ""
+                for query in search_lines:
+                    if not query or query in seen_queries:
+                        continue
+                    seen_queries.add(query)
+                    retrieved = wiki_df.sem_search("text", query, K=TOP_K)
+                    passages = "\n".join(
+                        f"[{r.title}] {r.text}" for r in retrieved.itertuples()
+                    )
+                    if verbose:
+                        print(f"    [turn {turn+1}] search: {query!r}")
+                        for r in retrieved.itertuples():
+                            print(f"      [{r.title}] {r.text[:120]}")
+                    results_text += f"Results for '{query}':\n{passages or 'No results found.'}\n\n"
+                messages.append({"role": "user", "content": results_text.strip()})
+            else:
+                result = _parse_verdict(content)
+                if verbose:
+                    print(f"    [turn {turn+1}] decision: {result!r}")
+                return result
 
     return NOT_SUPPORTED
 
@@ -386,7 +487,7 @@ def agentic_classify(
 TOP_K = 5
 
 QUERY_GEN_PROMPT = (
-    "Generate a short search query to find Wikipedia evidence for this claim.\n"
+    "Generate a short search query (for a semantic search) to find Wikipedia evidence for this claim.\n"
     "Claim: {claim}\nQuery:"
 )
 
@@ -398,20 +499,36 @@ FILTER_PROMPT = (
 )
 
 
-def lotus_classify(claim: str, wiki_df: pd.DataFrame) -> str:
-    claim_df = pd.DataFrame([{"claim": claim}])
+def lotus_classify_batch(claims: list[str], wiki_df: pd.DataFrame, verbose: bool = False) -> list[str]:
+    """Run the full LOTUS pipeline over all claims at once.
 
-    # Step 1: map claim → search query
-    claim_df = claim_df.sem_map(QUERY_GEN_PROMPT, output_cols=["query"])
-    query = claim_df.iloc[0]["query"]
+    sem_map and sem_filter are batched across all claims; sem_search is
+    still per-claim (each claim has its own generated query).
+    """
+    claims_df = pd.DataFrame([{"claim": c} for c in claims])
 
-    # Step 2: search wiki for relevant sentences
-    retrieved = wiki_df.sem_search("text", query, K=TOP_K)
-    retrieved = retrieved.assign(claim=claim)
+    # Step 1: generate queries for all claims in one batched LM call
+    claims_df = claims_df.sem_map(QUERY_GEN_PROMPT, suffix="query")
 
-    # Step 3: filter — does any retrieved passage support the claim?
-    supported_rows = retrieved.sem_filter(FILTER_PROMPT)
-    return SUPPORTED if len(supported_rows) > 0 else NOT_SUPPORTED
+    # Step 2: search wiki per claim (queries differ), tag each row with claim index
+    retrieved_parts = []
+    for idx, row in enumerate(claims_df.itertuples()):
+        part = wiki_df.sem_search("text", row.query, K=TOP_K)
+        part = part.assign(claim=row.claim, _claim_idx=idx)
+        if verbose:
+            print(f"    [map]    claim {idx}: query={row.query!r}")
+            for r in part.itertuples():
+                print(f"    [search] [{r.title}] {r.text[:120]}")
+        retrieved_parts.append(part)
+    combined = pd.concat(retrieved_parts, ignore_index=True)
+
+    # Step 3: filter all (claim, passage) pairs in one batched LM call
+    supported = combined.sem_filter(FILTER_PROMPT)
+    supported_idxs = set(supported["_claim_idx"].tolist())
+    if verbose:
+        print(f"    [filter] {len(supported)}/{len(combined)} pairs passed")
+
+    return [SUPPORTED if i in supported_idxs else NOT_SUPPORTED for i in range(len(claims))]
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +603,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--colbert", action="store_true",
                    help="Use ColBERT retriever (GPU required). Default: SentenceTransformers.")
     p.add_argument("--output", default=None, help="Write per-claim results as JSONL")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Print agent tool calls, retrieved passages, and filter decisions.")
     return p.parse_args()
 
 
@@ -532,7 +651,10 @@ def main() -> None:
         for i, item in enumerate(claims, 1):
             claim = item["claim"]
             gold  = gold_label(item["label"])
-            pred  = agentic_classify(full_model, claim, wiki_df)
+            if args.verbose:
+                print(f"[agentic {i:>4}/{len(claims)}] {claim[:80]}")
+            pred  = agentic_classify(full_model, claim, wiki_df, verbose=args.verbose,
+                                     use_tools=(args.provider == "anthropic"))
             agentic_preds.append(pred)
             mark = "✓" if pred == gold else "✗"
             print(f"[agentic {i:>4}/{len(claims)}] {mark}  gold={gold:<14} pred={pred:<14}  {claim[:50]}")
@@ -543,13 +665,12 @@ def main() -> None:
     if run_lotus:
         tracker.reset()
         t_start = time.perf_counter()
-        for i, item in enumerate(claims, 1):
-            claim = item["claim"]
-            gold  = gold_label(item["label"])
-            pred  = lotus_classify(claim, wiki_df)
-            lotus_preds.append(pred)
+        all_claim_texts = [item["claim"] for item in claims]
+        lotus_preds = lotus_classify_batch(all_claim_texts, wiki_df, verbose=args.verbose)
+        for i, (item, pred) in enumerate(zip(claims, lotus_preds), 1):
+            gold = gold_label(item["label"])
             mark = "✓" if pred == gold else "✗"
-            print(f"[lotus   {i:>4}/{len(claims)}] {mark}  gold={gold:<14} pred={pred:<14}  {claim[:50]}")
+            print(f"[lotus   {i:>4}/{len(claims)}] {mark}  gold={gold:<14} pred={pred:<14}  {item['claim'][:50]}")
         lotus_time  = time.perf_counter() - t_start
         lotus_usage = {"input": tracker.input_tokens, "output": tracker.output_tokens, "cost": tracker.cost}
 
